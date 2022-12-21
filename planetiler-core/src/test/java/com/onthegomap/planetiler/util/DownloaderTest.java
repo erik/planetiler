@@ -144,8 +144,25 @@ class DownloaderTest {
     Path dest = path.resolve("out");
     String url = "http://url";
 
-    var resource1 = new Downloader.ResourceToDownload("resource", url, dest);
-    var exception = assertThrows(ExecutionException.class, () -> downloader.downloadIfNecessary(resource1).get());
+    var resource = new Downloader.ResourceToDownload("resource", url, dest);
+    var exception = assertThrows(ExecutionException.class, () -> downloader.downloadIfNecessary(resource).get());
+    assertInstanceOf(IllegalStateException.class, exception.getCause());
+    assertTrue(exception.getMessage().contains("--force"), exception.getMessage());
+  }
+
+  @Test
+  void testS3DownloadFailsIfTooBig() {
+    var downloader = new Downloader(config, stats, 2L) {
+      @Override
+      CompletableFuture<Long> getS3DownloadSize(S3ResourceToDownload resource) {
+        return CompletableFuture.completedFuture(Long.MAX_VALUE);
+      }
+    };
+
+    Path dest = path.resolve("out");
+
+    var resource = new Downloader.S3ResourceToDownload("resource", "s3://bucket/key", dest);
+    var exception = assertThrows(ExecutionException.class, () -> downloader.downloadIfNecessary(resource).get());
     assertInstanceOf(IllegalStateException.class, exception.getCause());
     assertTrue(exception.getMessage().contains("--force"), exception.getMessage());
   }

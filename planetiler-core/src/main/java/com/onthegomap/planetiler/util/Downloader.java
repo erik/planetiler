@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLConnection;
 import java.net.http.HttpClient;
@@ -35,6 +36,11 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.s3.S3AsyncClient;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.transfer.s3.S3TransferManager;
+import software.amazon.awssdk.transfer.s3.model.DownloadFileRequest;
+import software.amazon.awssdk.transfer.s3.progress.TransferListener;
 
 /**
  * A utility for downloading files to disk in parallel over HTTP.
@@ -49,6 +55,7 @@ import org.slf4j.LoggerFactory;
  * Downloader.create(PlanetilerConfig.defaults())
  *   .add("natural_earth", "http://url/of/natural_earth.zip", Path.of("natural_earth.zip"))
  *   .add("osm", "http://url/of/file.osm.pbf", Path.of("file.osm.pbf"))
+ *   .add("s3", "s3://my-bucket/key/of/file.zip", Path.of("file.zip"))
  *   .run();
  * }
  * </pre>
@@ -68,9 +75,10 @@ public class Downloader {
   private static final Logger LOGGER = LoggerFactory.getLogger(Downloader.class);
   private final PlanetilerConfig config;
   private final List<ResourceToDownload> toDownloadList = new ArrayList<>();
-  private final HttpClient client = HttpClient.newBuilder()
+  private final HttpClient httpClient = HttpClient.newBuilder()
     // explicitly follow redirects to capture final redirect url
     .followRedirects(HttpClient.Redirect.NEVER).build();
+  private final S3AsyncClient s3Client;
   private final ExecutorService executor;
   private final Stats stats;
   private final long chunkSizeBytes;
@@ -88,6 +96,11 @@ public class Downloader {
       thread.setDaemon(true);
       return thread;
     });
+
+    this.s3Client = S3AsyncClient.crtBuilder() // NOSONAR (java:S6241), don't want to set AWS region here.
+      .maxConcurrency(config.downloadThreads())
+      .minimumPartSizeInBytes(config.downloadChunkSizeMB() * 1_000_000L)
+      .build();
   }
 
   public static Downloader create(PlanetilerConfig config, Stats stats) {
@@ -145,12 +158,16 @@ public class Downloader {
    * @return {@code this} for chaining
    */
   public Downloader add(String id, String url, Path output) {
-    if (url.startsWith("geofabrik:")) {
-      url = Geofabrik.getDownloadUrl(url.replaceFirst("^geofabrik:", ""), config);
-    } else if (url.startsWith("aws:")) {
-      url = AwsOsm.getDownloadUrl(url.replaceFirst("^aws:", ""), config);
+    if (url.startsWith("s3:")) {
+      toDownloadList.add(new S3ResourceToDownload(id, url, output));
+    } else {
+      if (url.startsWith("geofabrik:")) {
+        url = Geofabrik.getDownloadUrl(url.replaceFirst("^geofabrik:", ""), config);
+      } else if (url.startsWith("aws:")) {
+        url = AwsOsm.getDownloadUrl(url.replaceFirst("^aws:", ""), config);
+      }
+      toDownloadList.add(new ResourceToDownload(id, url, output));
     }
-    toDownloadList.add(new ResourceToDownload(id, url, output));
     return this;
   }
 
@@ -171,7 +188,7 @@ public class Downloader {
 
     for (var toDownload : toDownloadList) {
       try {
-        long size = toDownload.metadata.get(10, TimeUnit.SECONDS).size;
+        long size = toDownload.downloadSize.get(10, TimeUnit.SECONDS);
         loggers.addStorageRatePercentCounter(toDownload.id, size, toDownload::bytesDownloaded, true);
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
@@ -188,12 +205,67 @@ public class Downloader {
   CompletableFuture<Void> downloadIfNecessary(ResourceToDownload resourceToDownload) {
     long existingSize = FileUtils.size(resourceToDownload.output);
 
+    if (resourceToDownload instanceof S3ResourceToDownload s3Resource) {
+      return downloadS3IfNecessary(s3Resource, existingSize);
+    } else {
+      return downloadHttpIfNecessary(resourceToDownload, existingSize);
+    }
+  }
+
+  CompletableFuture<Void> downloadS3IfNecessary(S3ResourceToDownload resource, long existingSize) {
+    return getS3DownloadSize(resource)
+      .thenComposeAsync(
+        downloadSize -> downloadS3Resource(resource, existingSize, downloadSize),
+        executor
+      );
+  }
+
+  CompletableFuture<Long> getS3DownloadSize(S3ResourceToDownload resource) {
+    return s3Client
+      .headObject(b -> b.bucket(resource.bucket).key(resource.key))
+      .whenComplete((response, exc) -> {
+        if (exc != null) {
+          resource.downloadSize.completeExceptionally(exc);
+        } else {
+          resource.downloadSize.complete(response.contentLength());
+        }
+      }).thenApply(HeadObjectResponse::contentLength);
+  }
+
+  CompletableFuture<Void> downloadS3Resource(S3ResourceToDownload resource, long existingSize, long downloadSize) {
+    if (downloadSize == existingSize) {
+      LOGGER.info("Skipping {}: {} already up-to-date", resource.id, resource.output);
+      return CompletableFuture.completedFuture(null);
+    }
+
+    // Ensure we have enough space for this download.
+    diskSpaceCheck.addDisk(resource.output, downloadSize, resource.id);
+    diskSpaceCheck.checkAgainstLimits(config.force(), false);
+
+    var transferManager = S3TransferManager.builder().s3Client(s3Client).build();
+    var downloadFuture = transferManager.downloadFile(
+      DownloadFileRequest.builder()
+        .getObjectRequest(b -> b.bucket(resource.bucket).key(resource.key))
+        .addTransferListener(new TransferListener() {
+          @Override
+          public void bytesTransferred(Context.BytesTransferred context) {
+            resource.progress.set(context.progressSnapshot().transferredBytes());
+          }
+        })
+        .destination(resource.output)
+        .build()
+    ).completionFuture();
+
+    return downloadFuture.thenApply(f -> null);
+  }
+
+  CompletableFuture<Void> downloadHttpIfNecessary(ResourceToDownload resourceToDownload, long existingSize) {
     return httpHeadFollowRedirects(resourceToDownload.url, 0)
       .whenComplete((metadata, err) -> {
         if (metadata != null) {
-          resourceToDownload.metadata.complete(metadata);
+          resourceToDownload.downloadSize.complete(metadata.size);
         } else {
-          resourceToDownload.metadata.completeExceptionally(err);
+          resourceToDownload.downloadSize.completeExceptionally(err);
         }
       })
       .thenComposeAsync(metadata -> {
@@ -211,7 +283,7 @@ public class Downloader {
           FileUtils.deleteOnExit(tmpPath);
           diskSpaceCheck.addDisk(tmpPath, metadata.size, resourceToDownload.id);
           diskSpaceCheck.checkAgainstLimits(config.force(), false);
-          return httpDownload(resourceToDownload, tmpPath)
+          return httpDownload(resourceToDownload, tmpPath, metadata)
             .thenCompose(result -> {
               try {
                 Files.move(tmpPath, resourceToDownload.output);
@@ -241,7 +313,7 @@ public class Downloader {
   }
 
   CompletableFuture<ResourceMetadata> httpHead(String url) {
-    return client
+    return httpClient
       .sendAsync(newHttpRequest(url).method("HEAD", HttpRequest.BodyPublishers.noBody()).build(),
         responseInfo -> {
           int status = responseInfo.statusCode();
@@ -265,7 +337,7 @@ public class Downloader {
       .thenApply(HttpResponse::body);
   }
 
-  private CompletableFuture<?> httpDownload(ResourceToDownload resource, Path tmpPath) {
+  private CompletableFuture<?> httpDownload(ResourceToDownload resource, Path tmpPath, ResourceMetadata metadata) {
     /*
      * Alternative using async HTTP client:
      *
@@ -275,56 +347,54 @@ public class Downloader {
      *
      * But it is slower on large files
      */
-    return resource.metadata.thenCompose(metadata -> {
-      String canonicalUrl = metadata.canonicalUrl;
-      record Range(long start, long end) {
+    String canonicalUrl = metadata.canonicalUrl;
+    record Range(long start, long end) {
 
-        long size() {
-          return end - start;
-        }
+      long size() {
+        return end - start;
       }
-      List<Range> chunks = new ArrayList<>();
-      boolean ranges = metadata.acceptRange && config.downloadThreads() > 1;
-      long chunkSize = ranges ? chunkSizeBytes : metadata.size;
-      for (long start = 0; start < metadata.size; start += chunkSize) {
-        long end = Math.min(start + chunkSize, metadata.size);
-        chunks.add(new Range(start, end));
-      }
-      // create an empty file
-      try {
-        Files.createFile(tmpPath);
-      } catch (IOException e) {
-        return CompletableFuture.failedFuture(new IOException("Failed to create " + resource.output, e));
-      }
-      return WorkerPipeline.start("download-" + resource.id, stats)
-        .readFromTiny("chunks", chunks)
-        .sinkToConsumer("chunk-downloader", Math.min(config.downloadThreads(), chunks.size()), range -> {
-          try (var fileChannel = FileChannel.open(tmpPath, WRITE)) {
-            while (range.size() > 0) {
-              try (
-                var inputStream = (ranges || range.start > 0) ? openStreamRange(canonicalUrl, range.start, range.end) :
-                  openStream(canonicalUrl);
-                var input = new ProgressChannel(Channels.newChannel(inputStream), resource.progress)
-              ) {
-                // ensure this file has been allocated up to the start of this block
-                fileChannel.write(ByteBuffer.allocate(1), range.start);
-                fileChannel.position(range.start);
-                long transferred = fileChannel.transferFrom(input, range.start, range.size());
-                if (transferred == 0) {
-                  throw new IOException("Transferred 0 bytes but " + range.size() + " expected: " + canonicalUrl);
-                } else if (transferred != range.size() && !metadata.acceptRange) {
-                  throw new IOException(
-                    "Transferred " + transferred + " bytes but " + range.size() + " expected: " + canonicalUrl +
-                      " and server does not support range requests");
-                }
-                range = new Range(range.start + transferred, range.end);
+    }
+    List<Range> chunks = new ArrayList<>();
+    boolean ranges = metadata.acceptRange && config.downloadThreads() > 1;
+    long chunkSize = ranges ? chunkSizeBytes : metadata.size;
+    for (long start = 0; start < metadata.size; start += chunkSize) {
+      long end = Math.min(start + chunkSize, metadata.size);
+      chunks.add(new Range(start, end));
+    }
+    // create an empty file
+    try {
+      Files.createFile(tmpPath);
+    } catch (IOException e) {
+      return CompletableFuture.failedFuture(new IOException("Failed to create " + resource.output, e));
+    }
+    return WorkerPipeline.start("download-" + resource.id, stats)
+      .readFromTiny("chunks", chunks)
+      .sinkToConsumer("chunk-downloader", Math.min(config.downloadThreads(), chunks.size()), range -> {
+        try (var fileChannel = FileChannel.open(tmpPath, WRITE)) {
+          while (range.size() > 0) {
+            try (
+              var inputStream = (ranges || range.start > 0) ? openStreamRange(canonicalUrl, range.start, range.end) :
+                openStream(canonicalUrl);
+              var input = new ProgressChannel(Channels.newChannel(inputStream), resource.progress)
+            ) {
+              // ensure this file has been allocated up to the start of this block
+              fileChannel.write(ByteBuffer.allocate(1), range.start);
+              fileChannel.position(range.start);
+              long transferred = fileChannel.transferFrom(input, range.start, range.size());
+              if (transferred == 0) {
+                throw new IOException("Transferred 0 bytes but " + range.size() + " expected: " + canonicalUrl);
+              } else if (transferred != range.size() && !metadata.acceptRange) {
+                throw new IOException(
+                  "Transferred " + transferred + " bytes but " + range.size() + " expected: " + canonicalUrl +
+                    " and server does not support range requests");
               }
+              range = new Range(range.start + transferred, range.end);
             }
-          } catch (IOException e) {
-            throw new UncheckedIOException(e);
           }
-        }).done();
-    });
+        } catch (IOException e) {
+          throw new UncheckedIOException(e);
+        }
+      }).done();
   }
 
   private HttpRequest.Builder newHttpRequest(String url) {
@@ -335,12 +405,20 @@ public class Downloader {
 
   record ResourceMetadata(Optional<String> redirect, String canonicalUrl, long size, boolean acceptRange) {}
 
-  record ResourceToDownload(
-    String id, String url, Path output, CompletableFuture<ResourceMetadata> metadata, AtomicLong progress
-  ) {
+  static class ResourceToDownload {
+
+    String url;
+    String id;
+    Path output;
+    AtomicLong progress;
+    CompletableFuture<Long> downloadSize;
 
     ResourceToDownload(String id, String url, Path output) {
-      this(id, url, output, new CompletableFuture<>(), new AtomicLong(0));
+      this.id = id;
+      this.url = url;
+      this.output = output;
+      this.progress = new AtomicLong(0);
+      this.downloadSize = new CompletableFuture<>();
     }
 
     public Path tmpPath() {
@@ -349,6 +427,24 @@ public class Downloader {
 
     public long bytesDownloaded() {
       return progress.get();
+    }
+  }
+
+  static class S3ResourceToDownload extends ResourceToDownload {
+
+    String bucket;
+    String key;
+
+    public S3ResourceToDownload(String id, String url, Path output) {
+      super(id, url, output);
+
+      try {
+        URI uri = new URI(url);
+        this.bucket = uri.getHost();
+        this.key = uri.getPath().substring(1);
+      } catch (URISyntaxException e) {
+        throw new IllegalArgumentException("Invalid S3 path: " + url);
+      }
     }
   }
 

@@ -21,7 +21,20 @@
     <prometheus.version>0.16.0</prometheus.version>
     <protobuf.version>3.21.12</protobuf.version>
     <geopackage.version>6.6.0</geopackage.version>
+    <awssdk.version>2.19.1</awssdk.version>
   </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>bom</artifactId>
+        <version>${awssdk.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
 
   <dependencies>
     <dependency>
@@ -143,6 +156,19 @@
       <groupId>mil.nga.geopackage</groupId>
       <artifactId>geopackage</artifactId>
       <version>${geopackage.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>s3</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>s3-transfer-manager</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>aws-crt-client</artifactId>
+      <version>${awssdk.version}-PREVIEW</version>
     </dependency>
   </dependencies>
 
