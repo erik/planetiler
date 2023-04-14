@@ -53,6 +53,7 @@ import org.locationtech.jts.geom.MultiPolygon;
 import org.locationtech.jts.geom.Polygon;
 import org.locationtech.jts.io.InputStreamInStream;
 import org.locationtech.jts.io.WKBReader;
+import org.locationtech.jts.io.WKTReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -757,6 +758,21 @@ class PlanetilerTests {
     );
 
     assertEquals(expected, results.tiles.size());
+  }
+
+  @Test
+  void testComplexPolygonHole() throws Exception {
+    Geometry geometry = new WKTReader().read(Files.newBufferedReader(TestUtils.pathToResource("terschelling.wkt")));
+    assertNotNull(geometry);
+
+    var results = runWithReaderFeatures(
+      Map.of("threads", "1"),
+      List.of(newReaderFeature(geometry, Map.of())),
+      (in, features) -> features.polygon("layer").setZoomRange(6, 6)
+    );
+
+    // Obviously wrong, just a breakpoint anchor.
+    assertEquals(0, results.tiles.size());
   }
 
   @Test
